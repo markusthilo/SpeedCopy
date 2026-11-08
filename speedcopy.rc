@@ -1,0 +1,5 @@
+/* Embedded into speedcopy.exe: manifest (id 1) and app icon (id 2). */
+/* 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST */
+1 24 "speedcopy.manifest"
+/* Application icon (not id 1 — that is the manifest) */
+2 ICON "icons/speedcopy.ico"

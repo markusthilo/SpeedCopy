@@ -2,7 +2,9 @@
 
 Fast recursive copy for Windows 10/11 (64-bit), with a size or MD5 verify pass afterward.
 
-One portable `speedcopy.exe`. No runtime DLLs to ship. With no arguments, a window opens. With arguments, it runs as a command-line tool.
+![image info](./SpeedCopy_v0.1.0.png)
+
+This is a one file standalone application - `speedcopy.exe` is all you need. No runtime DLLs to ship. With no arguments, a window opens. With arguments, it runs as a command-line tool.
 
 ## Features
 

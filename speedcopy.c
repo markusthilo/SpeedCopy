@@ -5,24 +5,26 @@
 /* License: MIT */
 /*
  * Recursively copy files and directories into one destination directory
- * or volume, then verify. Files are copied in parallel. Files of
- * 16 MiB and more use overlapped unbuffered transfers (up to 512 MiB
- * buffers). Smaller files use one buffered read and write.
+ * or volume. Files are copied in parallel. Files of 16 MiB and more use
+ * overlapped unbuffered transfers (up to 512 MiB buffers). Smaller files
+ * use one buffered read and write. A check never runs on a copy task,
+ * and the copy does not wait for a comparison or a hash.
  *
  * The destination is a single directory. Each named source is placed
  * under its own name. A source drive root (D:\) is placed directly, so
  * its children keep their paths relative to that root.
  *
- * After the copy, one verify pass compares file sizes. -m or -md5 hashes
- * each source file while copying and each destination file while verifying.
- * Mismatches are warnings. -c or --csv writes one protocol row per file.
- * The status token is OK or MISSMATCH.
+ * -n or --no-verify copies only. By default, another task reads each
+ * destination size after that file has been copied and compares it.
+ * -m or -md5 hashes each source on other tasks and hashes each
+ * destination after that file has been copied. Mismatches are warnings.
+ * -c or --csv writes one protocol row per file.
  *
  * Paths use \ between directories and files.
  * Each source is -s or --source. The last argument is the destination.
- * -j or --job sets how many files are copied at once. With no arguments,
+ * -j or --jobs sets the maximum number of worker threads. With no arguments,
  * a window opens: source paths, one destination directory, an optional
- * CSV protocol, size or MD5 verify, and the job count.
+ * CSV protocol, no verification, size, or MD5, and the job count.
  *
  * Build: ./make-exe.sh
  *   x86_64-w64-mingw32-windres -O coff --target=pe-x86-64 -o speedcopy_res.o speedcopy.rc
@@ -42,7 +44,7 @@
 #include <winioctl.h>
 #include <shellapi.h>
 
-const wchar_t SPEEDCOPY_VERSION[] = L"0.1.0-2026-11-08";
+const wchar_t SPEEDCOPY_VERSION[] = L"0.2.0-2026-11-11";
 #define VERSION SPEEDCOPY_VERSION
 #include <io.h>
 #include <fcntl.h>
@@ -54,6 +56,13 @@ const wchar_t SPEEDCOPY_VERSION[] = L"0.1.0-2026-11-08";
 #define MD5_ROTL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
 #endif
 
+#define VERIFY_NONE 0
+#define VERIFY_SIZE 1
+#define VERIFY_MD5  2
+#define WORK_SIZE   1
+#define WORK_SRC    2
+#define WORK_DST    3
+
 #define ALIGN_SIZE 4096u
 #define BLOCK_SIZE (512u << 20)
 #define MIN_BLOCK (1u << 20)
@@ -62,6 +71,10 @@ const wchar_t SPEEDCOPY_VERSION[] = L"0.1.0-2026-11-08";
 #define SHARE_ANY (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
 #define OVERWRITE_COUNT_LIMIT 1000
 #define COPY_FAIL_LIMIT 10000
+/* With no verification every thread copies at full speed. More than a few
+ * of those at once make the disks slower, so the copy stays under this
+ * even when the job limit is higher. */
+#define COPY_ONLY_THREADS 4
 
 static CRITICAL_SECTION g_out_lock;
 static volatile LONG g_out_lock_ready;
@@ -70,10 +83,10 @@ static volatile LONG g_walk_err;
 static volatile LONG g_no_unbuffered;
 static volatile LONG g_phase;
 static volatile LONG g_progress_drawn;
-static int g_md5;
+static int g_verify = VERIFY_SIZE;
 static int g_jobs;
-static int g_ask;
 static int g_force;
+static int g_overwrite_pass;
 static int g_tty;
 static int g_csv_err;
 static int g_verify_oom;
@@ -87,8 +100,10 @@ static LONG64 g_copy_files;
 static LONG64 g_copy_fail;
 static LONG64 g_copy_bytes;
 static LONG64 g_copy_progress;
-static LONG64 g_ver_done;
 static LONG64 g_ver_progress;
+static LONG64 g_check_total;
+static LONG64 g_tail_base;
+static LONG64 g_settled;
 static LONG64 g_ok;
 static LONG64 g_bad;
 static volatile LONG g_stop;
@@ -120,6 +135,7 @@ struct job {
 	int dst_present;
 	int ok;
 	int omit;
+	volatile LONG parts;
 	struct job *qnext;
 	struct job *allnext;
 };
@@ -149,6 +165,24 @@ struct pool {
 	int started;
 	int ready;
 };
+
+struct work {
+	struct job *job;
+	int kind;
+	struct work *next;
+};
+
+struct work_queue {
+	struct work *head;
+	struct work *tail;
+	CRITICAL_SECTION lock;
+	HANDLE sem;
+	HANDLE init_sem;
+	volatile LONG ready;
+};
+
+static struct work_queue *g_checks;
+static volatile LONG g_check_live;
 
 struct tick {
 	LARGE_INTEGER t0;
@@ -186,6 +220,8 @@ static void warn(LPCWSTR fmt, ...)
 {
 	va_list ap;
 
+	if (g_overwrite_pass)
+		return;
 	InterlockedIncrement(&g_warn);
 	out_lock();
 	if (g_progress_drawn) {
@@ -209,6 +245,8 @@ static void caution(LPCWSTR fmt, ...)
 {
 	va_list ap;
 
+	if (g_overwrite_pass)
+		return;
 	out_lock();
 	if (g_progress_drawn) {
 		if (g_tty)
@@ -619,7 +657,11 @@ static void stamp_meta(LPCWSTR src, LPCWSTR dst)
 
 static void remember_dir(LPCWSTR src, LPCWSTR dst)
 {
-	struct dir_stamp *d = (struct dir_stamp *)LocalAlloc(LMEM_FIXED, sizeof(*d));
+	struct dir_stamp *d;
+
+	if (g_overwrite_pass)
+		return;
+	d = (struct dir_stamp *)LocalAlloc(LMEM_FIXED, sizeof(*d));
 
 	if (!d) {
 		warn(L"out of memory keeping attributes of \"%s\"", dst);
@@ -947,14 +989,6 @@ static void hex_md5(const BYTE m[16], int ok, LPWSTR out)
 		out[i * 2 + 1] = hexd[m[i] & 0xf];
 	}
 	out[32] = 0;
-}
-
-static void md5_of_empty(BYTE out[16])
-{
-	struct md5 m;
-
-	md5_init(&m);
-	md5_final(&m, out);
 }
 
 static int io_too_big(DWORD err)
@@ -1726,6 +1760,8 @@ static DWORD hash_sync(HANDLE h, void *buf, DWORD cap, ULONGLONG logical, struct
 	while (at < logical) {
 		DWORD n = chunk_len(logical, at, cap);
 
+		if (user_stopped() || InterlockedCompareExchange(&g_fail_stop, 0, 0))
+			return ERROR_CANCELLED;
 		if (!io_at(h, 0, buf, n, at)) {
 			DWORD e = GetLastError();
 
@@ -1773,6 +1809,10 @@ static DWORD hash_pipeline(LPCWSTR path, LPVOID buf[2], DWORD xfer, ULONGLONG lo
 		DWORD hash_len;
 		int hash_slot;
 
+		if (user_stopped() || InterlockedCompareExchange(&g_fail_stop, 0, 0)) {
+			err = ERROR_CANCELLED;
+			goto done;
+		}
 		if (!retry_end(h, &rd, 0, buf[slot], len, at)) {
 			err = GetLastError();
 			if (!err)
@@ -1807,7 +1847,8 @@ done:
 	return err;
 }
 
-static DWORD hash_file(LPCWSTR path, LPVOID buf[2], DWORD cap, BYTE out[16])
+static DWORD hash_file(LPCWSTR path, LPVOID buf[2], DWORD cap, BYTE out[16],
+	ULONGLONG *size_out)
 {
 	HANDLE h;
 	LARGE_INTEGER sz;
@@ -1815,6 +1856,8 @@ static DWORD hash_file(LPCWSTR path, LPVOID buf[2], DWORD cap, BYTE out[16])
 	struct md5 hash;
 	DWORD err;
 
+	if (size_out)
+		*size_out = 0;
 	h = open_file(path, GENERIC_READ, SHARE_ANY, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN);
 	if (h == INVALID_HANDLE_VALUE) {
 		err = GetLastError();
@@ -1826,6 +1869,8 @@ static DWORD hash_file(LPCWSTR path, LPVOID buf[2], DWORD cap, BYTE out[16])
 		return err ? err : ERROR_GEN_FAILURE;
 	}
 	logical = (ULONGLONG)sz.QuadPart;
+	if (size_out)
+		*size_out = logical;
 	md5_init(&hash);
 	if (!logical) {
 		CloseHandle(h);
@@ -1840,7 +1885,7 @@ static DWORD hash_file(LPCWSTR path, LPVOID buf[2], DWORD cap, BYTE out[16])
 			md5_final(&hash, out);
 			return 0;
 		}
-		if (hash.nbytes)
+		if (hash.nbytes || err == ERROR_CANCELLED)
 			return err;
 		/* Overlapped reads are not available on every file system. Read it plainly. */
 		md5_init(&hash);
@@ -1884,25 +1929,32 @@ static int enqueue_job(struct job_queue *q, struct job *j)
 
 static int remember_file(LPWSTR src, LPWSTR dst, ULONGLONG bytes)
 {
-	struct job *j = (struct job *)LocalAlloc(LMEM_ZEROINIT, sizeof(*j));
+	struct job *j;
 	DWORD attr;
 
+	/* The check pass only counts files the copy would replace. */
+	if (g_overwrite_pass) {
+		if (g_overwrite <= OVERWRITE_COUNT_LIMIT) {
+			attr = get_attrs(dst);
+			if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+				InterlockedIncrement64(&g_overwrite);
+				if (g_overwrite > OVERWRITE_COUNT_LIMIT)
+					g_scan_stop = 1;
+			}
+		}
+		LocalFree(src);
+		LocalFree(dst);
+		return 0;
+	}
+	j = (struct job *)LocalAlloc(LMEM_ZEROINIT, sizeof(*j));
 	if (!j)
 		return 1;
 	j->src = src;
 	j->dst = dst;
+	j->src_size = bytes;
 	catalog_add(j);
 	InterlockedIncrement64(&g_queued);
 	InterlockedAdd64(&g_total_bytes, (LONG64)bytes);
-	/* Stop looking once it is already known that more than 1000 files exist. */
-	if (g_overwrite <= OVERWRITE_COUNT_LIMIT) {
-		attr = get_attrs(dst);
-		if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-			InterlockedIncrement64(&g_overwrite);
-			if (g_overwrite > OVERWRITE_COUNT_LIMIT)
-				g_scan_stop = 1;
-		}
-	}
 	return 0;
 }
 
@@ -2004,18 +2056,73 @@ int speedcopy_correct_jobs(const wchar_t *s, int *out)
 	return 1;
 }
 
-static int task_count(void)
+static int buffer_slots(void)
 {
-	if (g_jobs > 0)
-		return g_jobs;
-	return speedcopy_optimum_jobs();
+	MEMORYSTATUSEX mem;
+	unsigned n = 1;
+
+	mem.dwLength = sizeof(mem);
+	if (GlobalMemoryStatusEx(&mem) && mem.ullTotalPhys) {
+		n = (unsigned)(mem.ullTotalPhys / 2 / (2ull * BLOCK_SIZE));
+		if (n < 1)
+			n = 1;
+	}
+	return (int)n;
 }
 
-static int pool_start(struct pool *p, struct job_queue *q, LPTHREAD_START_ROUTINE fn)
+/* copy_n and check_n are the threads that will run. Their sum never
+ * exceeds the job limit. A size check takes one thread and no copy
+ * buffer. An MD5 check takes a buffer, so it shares that budget too. */
+static void thread_plan(int *copy_n, int *check_n)
 {
-	int n, t;
+	int limit = g_jobs > 0 ? g_jobs : speedcopy_optimum_jobs();
+	int slots = buffer_slots();
 
-	n = task_count();
+	if (limit < 1)
+		limit = 1;
+	*copy_n = 1;
+	*check_n = 0;
+	if (g_verify == VERIFY_NONE) {
+		if (limit > COPY_ONLY_THREADS)
+			limit = COPY_ONLY_THREADS;
+		if (limit > slots)
+			limit = slots;
+		*copy_n = limit;
+		return;
+	}
+	if (g_verify == VERIFY_SIZE) {
+		if (limit < 2) {
+			*copy_n = 1;
+			return;
+		}
+		*check_n = 1;
+		*copy_n = limit - 1;
+		if (*copy_n > slots)
+			*copy_n = slots;
+		if (*copy_n < 1)
+			*copy_n = 1;
+		return;
+	}
+	{
+		int total = limit < slots ? limit : slots;
+
+		if (total < 2) {
+			*copy_n = 1;
+			return;
+		}
+		*check_n = total / 4;
+		if (*check_n < 1)
+			*check_n = 1;
+		if (*check_n > total - 1)
+			*check_n = total - 1;
+		*copy_n = total - *check_n;
+	}
+}
+
+static int pool_start(struct pool *p, struct job_queue *q, LPTHREAD_START_ROUTINE fn, int n)
+{
+	int t;
+
 	if (n < 1)
 		n = 1;
 	if (p->threads)
@@ -2060,6 +2167,9 @@ static void pool_join(struct pool *p, struct job_queue *q)
 	p->ready = 0;
 }
 
+static void after_copy(struct job *j);
+static void check_size(struct job *j);
+
 static DWORD WINAPI copy_task(LPVOID param)
 {
 	struct job_queue *q = param;
@@ -2078,7 +2188,6 @@ static DWORD WINAPI copy_task(LPVOID param)
 		ULONGLONG logical = 0;
 		int known = 0;
 		DWORD err;
-		BYTE digest[16];
 		WCHAR msg[512];
 
 		ZeroMemory(&oe, sizeof(oe));
@@ -2089,8 +2198,8 @@ static DWORD WINAPI copy_task(LPVOID param)
 		}
 		if (user_stopped() || InterlockedCompareExchange(&g_fail_stop, 0, 0))
 			break;
-		err = copy_auto(j->src, j->dst, buf, xfer, g_md5 ? digest : NULL,
-			&logical, &known, &oe);
+		/* Hashing and comparing happen on other tasks. This task only copies. */
+		err = copy_auto(j->src, j->dst, buf, xfer, NULL, &logical, &known, &oe);
 		if (user_stopped()) {
 			delete_path(j->dst);
 			break;
@@ -2099,9 +2208,9 @@ static DWORD WINAPI copy_task(LPVOID param)
 		j->copy_size_valid = known;
 		j->copy_err = err;
 		j->copy_ok = (err == 0);
-		if (!err && g_md5) {
-			memcpy(j->src_md5, digest, 16);
-			j->src_md5_ok = 1;
+		if (known) {
+			j->src_size = logical;
+			j->src_present = 1;
 		}
 		if (err && oe.what && wcscmp(oe.what, L"Not a regular file") == 0) {
 			caution(L"skipping \"%s\": it is not a regular file", j->src);
@@ -2122,6 +2231,7 @@ static DWORD WINAPI copy_task(LPVOID param)
 			InterlockedIncrement64(&g_copy_files);
 			InterlockedAdd64(&g_copy_bytes, (LONG64)logical);
 		}
+		after_copy(j);
 		InterlockedIncrement64(&g_copy_done);
 	}
 	free_buffers(buf);
@@ -2141,7 +2251,7 @@ static void warn_mismatch(struct job *j)
 			j->src, j->dst);
 		return;
 	}
-	if (!g_md5 || j->src_size != j->dst_size) {
+	if (g_verify != VERIFY_MD5 || j->src_size != j->dst_size) {
 		caution(L"\"%s\" is %llu bytes and \"%s\" is %llu bytes",
 			j->src, (unsigned long long)j->src_size,
 			j->dst, (unsigned long long)j->dst_size);
@@ -2153,53 +2263,28 @@ static void warn_mismatch(struct job *j)
 		j->src, sh, j->dst, dh);
 }
 
-static void verify_one(struct job *j, LPVOID buf[2], DWORD cap)
+static int stopped_now(void)
 {
-	ULONGLONG ss = 0, ds = 0;
-	int sp, dp, size_ok, hash_ok;
+	return user_stopped() || InterlockedCompareExchange(&g_fail_stop, 0, 0);
+}
 
-	sp = file_size_of(j->src, &ss);
-	dp = file_size_of(j->dst, &ds);
+static void finish_md5(struct job *j)
+{
+	int size_ok, hash_ok;
+
+	if (stopped_now()) {
+		InterlockedIncrement64(&g_settled);
+		return;
+	}
 	if (j->omit) {
 		j->ok = 1;
-		InterlockedIncrement64(&g_ver_done);
-		if (j->copy_size_valid)
-			InterlockedAdd64(&g_ver_progress, (LONG64)j->copy_size);
+		InterlockedIncrement64(&g_settled);
 		return;
 	}
-	j->src_present = sp;
-	j->dst_present = dp;
-	if (sp)
-		j->src_size = ss;
-	else if (j->copy_size_valid)
-		j->src_size = j->copy_size;
-	else
-		j->src_size = 0;
-	j->dst_size = dp ? ds : 0;
 	/* Both files exist and both are empty. That is a match, including MD5 of no bytes. */
-	if (sp && dp && ss == 0 && ds == 0) {
-		if (g_md5) {
-			md5_of_empty(j->src_md5);
-			md5_of_empty(j->dst_md5);
-			j->src_md5_ok = 1;
-			j->dst_md5_ok = 1;
-		}
-		j->ok = 1;
-		InterlockedIncrement64(&g_ok);
-		InterlockedIncrement64(&g_ver_done);
-		return;
-	}
-	if (g_md5 && dp && cap) {
-		if (!hash_file(j->dst, buf, cap, j->dst_md5))
-			j->dst_md5_ok = 1;
-	} else if (!(g_md5 && dp)) {
-		InterlockedAdd64(&g_ver_progress, (LONG64)(dp ? ds : (sp ? ss : 0)));
-	}
-	size_ok = sp && dp && ss == ds;
-	hash_ok = 1;
-	if (g_md5)
-		hash_ok = j->src_md5_ok && j->dst_md5_ok
-			&& memcmp(j->src_md5, j->dst_md5, 16) == 0;
+	size_ok = j->src_present && j->dst_present && j->src_size == j->dst_size;
+	hash_ok = j->src_md5_ok && j->dst_md5_ok
+		&& memcmp(j->src_md5, j->dst_md5, 16) == 0;
 	j->ok = j->copy_ok && size_ok && hash_ok;
 	if (j->ok)
 		InterlockedIncrement64(&g_ok);
@@ -2207,16 +2292,210 @@ static void verify_one(struct job *j, LPVOID buf[2], DWORD cap)
 		InterlockedIncrement64(&g_bad);
 	if (!j->ok && !j->copy_err)
 		warn_mismatch(j);
-	InterlockedIncrement64(&g_ver_done);
+	InterlockedIncrement64(&g_settled);
 }
 
-static DWORD WINAPI verify_task(LPVOID param)
+/* The caller that brings the count to 3 publishes the result. Copy, source hash, and destination hash each count once. */
+static void md5_part_done(struct job *j)
 {
-	struct job_queue *q = param;
+	if (InterlockedIncrement(&j->parts) == 3)
+		finish_md5(j);
+}
+
+static int work_enqueue_node(struct work_queue *q, struct work *w)
+{
+	w->next = NULL;
+	EnterCriticalSection(&q->lock);
+	if (q->tail)
+		q->tail->next = w;
+	else
+		q->head = w;
+	q->tail = w;
+	LeaveCriticalSection(&q->lock);
+	ReleaseSemaphore(q->sem, 1, NULL);
+	return 0;
+}
+
+static int enqueue_work(struct work_queue *q, struct job *j, int kind)
+{
+	struct work *w;
+
+	w = (struct work *)LocalAlloc(LMEM_ZEROINIT, sizeof(*w));
+	if (!w) {
+		warn(L"out of memory checking \"%s\"", j->src);
+		if (kind == WORK_SRC || kind == WORK_DST)
+			md5_part_done(j);
+		else {
+			j->ok = 0;
+			InterlockedIncrement64(&g_bad);
+			InterlockedIncrement64(&g_settled);
+		}
+		return 1;
+	}
+	w->job = j;
+	w->kind = kind;
+	return work_enqueue_node(q, w);
+}
+
+static int enqueue_work_sentinel(struct work_queue *q)
+{
+	struct work *w = (struct work *)LocalAlloc(LMEM_ZEROINIT, sizeof(*w));
+
+	if (!w)
+		return 1;
+	return work_enqueue_node(q, w);
+}
+
+static struct work *dequeue_work(struct work_queue *q)
+{
+	struct work *w;
+
+	WaitForSingleObject(q->sem, INFINITE);
+	EnterCriticalSection(&q->lock);
+	w = q->head;
+	if (w) {
+		q->head = w->next;
+		if (!q->head)
+			q->tail = NULL;
+	}
+	LeaveCriticalSection(&q->lock);
+	return w;
+}
+
+static void after_copy(struct job *j)
+{
+	if (g_verify == VERIFY_NONE) {
+		j->ok = j->copy_ok;
+		return;
+	}
+	if (j->omit) {
+		j->ok = 1;
+		if (g_verify == VERIFY_MD5 && g_check_live) {
+			md5_part_done(j);
+			md5_part_done(j);
+			return;
+		}
+		InterlockedIncrement64(&g_settled);
+		return;
+	}
+	/* No check thread. A size compare is one metadata call on this thread.
+	 * An MD5 hash is not done here: it would hold the copy up. */
+	if (!g_check_live) {
+		if (g_verify == VERIFY_SIZE) {
+			check_size(j);
+			return;
+		}
+		j->ok = 0;
+		return;
+	}
+	if (!j->copy_ok) {
+		j->ok = 0;
+		j->dst_present = 0;
+		j->dst_size = 0;
+		if (g_verify == VERIFY_MD5) {
+			md5_part_done(j);
+			md5_part_done(j);
+			return;
+		}
+		InterlockedIncrement64(&g_bad);
+		InterlockedIncrement64(&g_settled);
+		return;
+	}
+	if (g_verify == VERIFY_SIZE) {
+		if (!enqueue_work(g_checks, j, WORK_SIZE))
+			InterlockedAdd64(&g_check_total, (LONG64)j->copy_size);
+		return;
+	}
+	md5_part_done(j);
+	if (!enqueue_work(g_checks, j, WORK_DST))
+		InterlockedAdd64(&g_check_total, (LONG64)j->copy_size);
+}
+
+static void check_size(struct job *j)
+{
+	ULONGLONG ds = 0;
+	int dp, size_ok;
+
+	if (stopped_now()) {
+		InterlockedIncrement64(&g_settled);
+		return;
+	}
+	dp = file_size_of(j->dst, &ds);
+	j->dst_present = dp;
+	j->dst_size = dp ? ds : 0;
+	size_ok = j->src_present && dp && j->src_size == j->dst_size;
+	j->ok = j->copy_ok && size_ok;
+	if (j->ok)
+		InterlockedIncrement64(&g_ok);
+	else
+		InterlockedIncrement64(&g_bad);
+	if (!j->ok && !j->copy_err)
+		warn_mismatch(j);
+	InterlockedAdd64(&g_ver_progress, (LONG64)j->src_size);
+	InterlockedIncrement64(&g_settled);
+}
+
+static void check_src_md5(struct job *j, LPVOID buf[2], DWORD cap)
+{
+	HANDLE h;
+	DWORD kind;
+	ULONGLONG sz = 0;
+
+	/* Do not read a pipe or a device. That would consume bytes the copy still needs. */
+	if (!j->omit && !stopped_now()) {
+		h = open_file(j->src, GENERIC_READ, SHARE_ANY, OPEN_EXISTING,
+			FILE_FLAG_SEQUENTIAL_SCAN);
+		if (h != INVALID_HANDLE_VALUE) {
+			kind = GetFileType(h);
+			CloseHandle(h);
+			if (kind == FILE_TYPE_DISK
+				&& !hash_file(j->src, buf, cap, j->src_md5, &sz))
+				j->src_md5_ok = 1;
+		}
+	}
+	md5_part_done(j);
+}
+
+static void check_dst_md5(struct job *j, LPVOID buf[2], DWORD cap)
+{
+	ULONGLONG sz = 0;
+
+	if (j->omit || !j->copy_ok || stopped_now()) {
+		md5_part_done(j);
+		return;
+	}
+	if (!hash_file(j->dst, buf, cap, j->dst_md5, &sz)) {
+		j->dst_md5_ok = 1;
+		j->dst_size = sz;
+		j->dst_present = 1;
+	} else if (!stopped_now()) {
+		j->dst_present = file_size_of(j->dst, &j->dst_size);
+	}
+	md5_part_done(j);
+}
+
+static void begin_background(int *background)
+{
+	*background = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+	if (!*background)
+		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+}
+
+static void end_background(int background)
+{
+	if (background)
+		SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+}
+
+static DWORD WINAPI check_task(LPVOID param)
+{
+	struct work_queue *q = param;
 	LPVOID buf[2] = {NULL, NULL};
 	DWORD xfer = 0;
+	int background = 0;
 
-	if (g_md5) {
+	/* Take the read buffer before dropping to background priority. */
+	if (g_verify == VERIFY_MD5) {
 		xfer = alloc_buffers(buf);
 		if (xfer)
 			InterlockedIncrement(&q->ready);
@@ -2224,40 +2503,46 @@ static DWORD WINAPI verify_task(LPVOID param)
 		InterlockedIncrement(&q->ready);
 	}
 	ReleaseSemaphore(q->init_sem, 1, NULL);
-	if (g_md5 && !xfer)
+	if (g_verify == VERIFY_MD5 && !xfer)
 		return 0;
+	/* Stay behind the copy so a hash or a size read does not take its disk time. */
+	begin_background(&background);
 
 	for (;;) {
-		struct job *j = dequeue(q);
+		struct work *w = dequeue_work(q);
+		struct job *j;
 
-		if (!j || !j->src) {
-			if (j)
-				LocalFree(j);
+		if (!w || !w->job) {
+			if (w)
+				LocalFree(w);
 			break;
 		}
-		verify_one(j, buf, xfer);
+		j = w->job;
+		if (stopped_now()) {
+			LocalFree(w);
+			break;
+		}
+		if (w->kind == WORK_SIZE)
+			check_size(j);
+		else if (w->kind == WORK_SRC)
+			check_src_md5(j, buf, xfer);
+		else if (w->kind == WORK_DST)
+			check_dst_md5(j, buf, xfer);
+		LocalFree(w);
 	}
 	free_buffers(buf);
+	end_background(background);
 	return 0;
 }
 
-static void verify_all_main(void)
+static void enqueue_src_hashes(struct work_queue *q)
 {
 	struct job *j;
-	LPVOID buf[2] = {NULL, NULL};
-	DWORD xfer = 0;
 
-	if (g_md5) {
-		xfer = alloc_buffers(buf);
-		if (!xfer) {
-			warn(L"verification did not run because there is not enough memory for an MD5 buffer");
-			g_verify_oom = 1;
-			return;
-		}
+	for (j = g_all_head; j; j = j->allnext) {
+		if (!enqueue_work(q, j, WORK_SRC))
+			InterlockedAdd64(&g_check_total, (LONG64)j->src_size);
 	}
-	for (j = g_all_head; j; j = j->allnext)
-		verify_one(j, buf, xfer);
-	free_buffers(buf);
 }
 
 static int create_planned_dirs(void)
@@ -2278,21 +2563,17 @@ static int create_planned_dirs(void)
 	return bad;
 }
 
-static int confirm_overwrite(void)
+static void report_overwrites(void)
 {
-	HANDLE in;
-	char buf[8];
-	DWORD n = 0;
-
-	fwprintf(stdout, L"ASK %llu\n", (unsigned long long)g_overwrite);
-	fflush(stdout);
-	in = GetStdHandle(STD_INPUT_HANDLE);
-	if (in == NULL || in == INVALID_HANDLE_VALUE)
-		return 0;
-	if (!ReadFile(in, buf, sizeof(buf) - 1, &n, NULL) || n < 1)
-		return 0;
-	buf[n] = 0;
-	return buf[0] == 'y' || buf[0] == 'Y';
+	if (g_overwrite > OVERWRITE_COUNT_LIMIT)
+		fwprintf(stderr, L">1000 files already exist and would be overwritten.\n");
+	else if (g_overwrite == 1)
+		fwprintf(stderr, L"1 file already exists and would be overwritten.\n");
+	else
+		fwprintf(stderr, L"%llu files already exist and would be overwritten.\n",
+			(unsigned long long)g_overwrite);
+	fwprintf(stderr, L"Use -f or --force to copy anyway.\n");
+	fflush(stderr);
 }
 
 static DWORD WINAPI stop_watcher(LPVOID unused)
@@ -2580,11 +2861,22 @@ static int csv_row(struct job *j)
 {
 	int i;
 
+	if (g_verify == VERIFY_NONE) {
+		if (csv_write_path(g_csv, j->src))
+			return 1;
+		if (fprintf(g_csv, ", %llu, ", (unsigned long long)j->src_size) < 0)
+			return 1;
+		if (csv_write_path(g_csv, j->dst))
+			return 1;
+		if (fprintf(g_csv, ", \"%s\"\n", j->ok ? "OK" : "ERROR") < 0)
+			return 1;
+		return 0;
+	}
 	if (csv_write_path(g_csv, j->src))
 		return 1;
 	if (fprintf(g_csv, ", %llu", (unsigned long long)j->src_size) < 0)
 		return 1;
-	if (g_md5) {
+	if (g_verify == VERIFY_MD5) {
 		if (fprintf(g_csv, ", \"") < 0)
 			return 1;
 		if (j->src_md5_ok) {
@@ -2602,7 +2894,7 @@ static int csv_row(struct job *j)
 		return 1;
 	if (fprintf(g_csv, ", %llu", (unsigned long long)j->dst_size) < 0)
 		return 1;
-	if (g_md5) {
+	if (g_verify == VERIFY_MD5) {
 		if (fprintf(g_csv, ", \"") < 0)
 			return 1;
 		if (j->dst_md5_ok) {
@@ -2630,9 +2922,12 @@ static void write_csv(void)
 		return;
 	if (!open_csv())
 		return;
-	head = g_md5
-		? "\"src_path\", \"src_bytes\", \"src_md5\", \"dst_path\", \"dst_bytes\", \"dst_md5\", \"result\"\n"
-		: "\"src_path\", \"src_bytes\", \"dst_path\", \"dst_bytes\", \"result\"\n";
+	if (g_verify == VERIFY_NONE)
+		head = "\"src_path\", \"src_bytes\", \"dst_path\", \"result\"\n";
+	else if (g_verify == VERIFY_MD5)
+		head = "\"src_path\", \"src_bytes\", \"src_md5\", \"dst_path\", \"dst_bytes\", \"dst_md5\", \"result\"\n";
+	else
+		head = "\"src_path\", \"src_bytes\", \"dst_path\", \"dst_bytes\", \"result\"\n";
 	if (fputs(head, g_csv) == EOF) {
 		warn(L"cannot write protocol \"%s\"", g_csv_path);
 		g_csv_err = 1;
@@ -2667,6 +2962,28 @@ static void human_bytes(LPWSTR dst, int cap, ULONGLONG n)
 	}
 	if (i == 0)
 		_snwprintf(dst, cap, L"%llu B", (unsigned long long)n);
+	else
+		_snwprintf(dst, cap, L"%.1f %s", v, u[i]);
+	dst[cap - 1] = 0;
+}
+
+/* Decimal units: 1 MB = 1000 kB = 1 000 000 bytes. */
+static void human_rate(LPWSTR dst, int cap, ULONGLONG n)
+{
+	static const wchar_t *u[] = {
+		L"B/sec", L"kB/sec", L"MB/sec", L"GB/sec", L"TB/sec", L"PB/sec"
+	};
+	double v = (double)n;
+	int i = 0;
+
+	if (cap <= 0)
+		return;
+	while (v >= 1000.0 && i < 5) {
+		v /= 1000.0;
+		i++;
+	}
+	if (i == 0)
+		_snwprintf(dst, cap, L"%llu B/sec", (unsigned long long)n);
 	else
 		_snwprintf(dst, cap, L"%.1f %s", v, u[i]);
 	dst[cap - 1] = 0;
@@ -2711,7 +3028,7 @@ static int g_spin_i;
 static void print_progress(void)
 {
 	static const wchar_t spin[] = L"-\\|/";
-	WCHAR done_h[40], total_h[40], rate_h[40], rate_s[48], eta[16];
+	WCHAR done_h[40], total_h[40], rate_h[40], eta[16];
 	const wchar_t *phase;
 	LONG64 done, total;
 	ULONGLONG ms, bps, remain, eta_s;
@@ -2720,13 +3037,14 @@ static void print_progress(void)
 	if (g_phase == 0) {
 		phase = L"copied";
 		done = g_copy_progress;
+		total = g_total_bytes;
 	} else {
-		phase = L"verified";
-		done = g_ver_progress;
+		phase = L"checked";
+		done = g_ver_progress - g_tail_base;
+		total = g_check_total - g_tail_base;
 	}
 	if (done < 0)
 		done = 0;
-	total = g_total_bytes;
 	if (total < 0)
 		total = 0;
 	if (done > total && total > 0)
@@ -2740,7 +3058,7 @@ static void print_progress(void)
 	human_bytes(total_h, 40, (ULONGLONG)total);
 	ms = tick_ms(&g_phase_tick);
 	bps = ms > 0 ? (ULONGLONG)done * 1000ULL / ms : 0;
-	human_bytes(rate_h, 40, bps);
+	human_rate(rate_h, 40, bps);
 	if (bps > 0 && total > done) {
 		remain = (ULONGLONG)(total - done);
 		eta_s = remain / bps;
@@ -2754,11 +3072,9 @@ static void print_progress(void)
 		wcscpy(eta, L"--:--:--");
 	}
 	eta[15] = 0;
-	_snwprintf(rate_s, 48, L"%s/s", rate_h);
-	rate_s[47] = 0;
 	out_lock();
-	fwprintf(stdout, L"... %-8s %3d%%  %10s / %10s  %12s  ETA %s %c\r",
-		phase, (int)(pct + 0.5), done_h, total_h, rate_s, eta, spin[g_spin_i & 3]);
+	fwprintf(stdout, L"... %-8s %3d%%  %10s / %10s  %14s  ETA %s %c\r",
+		phase, (int)(pct + 0.5), done_h, total_h, rate_h, eta, spin[g_spin_i & 3]);
 	fflush(stdout);
 	g_progress_drawn = 1;
 	g_spin_i++;
@@ -2817,21 +3133,26 @@ static void progress_stop(void)
 static void print_copy_summary(void)
 {
 	if (g_copy_fail)
-		fwprintf(stdout, L"Copy pass finished, %llu failed\n",
+		fwprintf(stdout, L"Copy finished, %llu failed\n",
 			(unsigned long long)g_copy_fail);
 	else
-		fwprintf(stdout, L"Copy pass finished\n");
+		fwprintf(stdout, L"Copy finished\n");
 	fflush(stdout);
 }
 
-static void print_verify_summary(void)
+static void print_protocol(void)
 {
-	fwprintf(stdout, L"Verify pass finished, %llu ok, %llu %s\n",
+	if (g_csv_path && !g_csv_err && !g_verify_oom)
+		fwprintf(stdout, L"Protocol \"%s\"\n", g_csv_path);
+}
+
+static void print_check_summary(void)
+{
+	fwprintf(stdout, L"Verification finished, %llu ok, %llu %s\n",
 		(unsigned long long)g_ok,
 		(unsigned long long)g_bad,
 		g_bad == 1 ? L"mismatch" : L"mismatches");
-	if (g_csv_path && !g_csv_err && !g_verify_oom)
-		fwprintf(stdout, L"Protocol \"%s\"\n", g_csv_path);
+	print_protocol();
 	fflush(stdout);
 }
 
@@ -2842,11 +3163,11 @@ static void print_run_summary(ULONGLONG ms)
 
 	format_span(ms, span, 40);
 	human_bytes(hb, 40, (ULONGLONG)g_copy_bytes);
-	human_bytes(rate, 48, bps);
+	human_rate(rate, 48, bps);
 	if (g_copy_files == 1)
-		fwprintf(stdout, L"Copied 1 file, %s, in %s, %s/s\n", hb, span, rate);
+		fwprintf(stdout, L"Copied 1 file, %s, in %s, %s\n", hb, span, rate);
 	else
-		fwprintf(stdout, L"Copied %llu files, %s, in %s, %s/s\n",
+		fwprintf(stdout, L"Copied %llu files, %s, in %s, %s\n",
 			(unsigned long long)g_copy_files, hb, span, rate);
 	fflush(stdout);
 }
@@ -2878,6 +3199,81 @@ static void queue_free(struct job_queue *q)
 	q->sem = q->init_sem = NULL;
 }
 
+static int work_init(struct work_queue *q)
+{
+	ZeroMemory(q, sizeof(*q));
+	InitializeCriticalSection(&q->lock);
+	q->sem = CreateSemaphoreW(NULL, 0, 0x7fffffff, NULL);
+	q->init_sem = CreateSemaphoreW(NULL, 0, speedcopy_job_limit(), NULL);
+	if (!q->sem || !q->init_sem) {
+		if (q->sem)
+			CloseHandle(q->sem);
+		if (q->init_sem)
+			CloseHandle(q->init_sem);
+		DeleteCriticalSection(&q->lock);
+		return 1;
+	}
+	return 0;
+}
+
+static void work_free(struct work_queue *q)
+{
+	if (q->sem)
+		CloseHandle(q->sem);
+	if (q->init_sem)
+		CloseHandle(q->init_sem);
+	DeleteCriticalSection(&q->lock);
+	q->sem = q->init_sem = NULL;
+}
+
+static int pool_start_work(struct pool *p, struct work_queue *q, LPTHREAD_START_ROUTINE fn, int n)
+{
+	int t;
+
+	if (n < 1)
+		n = 1;
+	if (p->threads)
+		LocalFree(p->threads);
+	p->threads = (HANDLE *)LocalAlloc(LMEM_ZEROINIT, (SIZE_T)n * sizeof(HANDLE));
+	p->started = 0;
+	p->ready = 0;
+	if (!p->threads)
+		return 1;
+	for (t = 0; t < n; t++) {
+		p->threads[t] = CreateThread(NULL, 0, fn, q, 0, NULL);
+		if (!p->threads[t])
+			break;
+		p->started++;
+	}
+	if (!p->started) {
+		LocalFree(p->threads);
+		p->threads = NULL;
+		return 1;
+	}
+	for (t = 0; t < p->started; t++)
+		WaitForSingleObject(q->init_sem, INFINITE);
+	p->ready = (int)q->ready;
+	return 0;
+}
+
+static void pool_join_work(struct pool *p, struct work_queue *q)
+{
+	int t;
+
+	for (t = 0; t < p->ready; t++)
+		enqueue_work_sentinel(q);
+	for (t = 0; t < p->started; t++) {
+		WaitForSingleObject(p->threads[t], INFINITE);
+		CloseHandle(p->threads[t]);
+		p->threads[t] = NULL;
+	}
+	if (p->threads)
+		LocalFree(p->threads);
+	p->threads = NULL;
+	p->started = 0;
+	p->ready = 0;
+}
+
 static void free_catalog(void)
 {
 	struct job *j = g_all_head;
@@ -2907,6 +3303,11 @@ static int is_md5_flag(LPCWSTR s)
 		|| wieq(s, L"/md5");
 }
 
+static int is_none_flag(LPCWSTR s)
+{
+	return wieq(s, L"-n") || wieq(s, L"--no-verify") || wieq(s, L"--none");
+}
+
 static int is_csv_flag(LPCWSTR s)
 {
 	return wieq(s, L"-c") || wieq(s, L"--csv") || wieq(s, L"/csv")
@@ -2920,12 +3321,7 @@ static int is_source_flag(LPCWSTR s)
 
 static int is_job_flag(LPCWSTR s)
 {
-	return wieq(s, L"-j") || wieq(s, L"--job");
-}
-
-static int is_ask_flag(LPCWSTR s)
-{
-	return wieq(s, L"--ask");
+	return wieq(s, L"-j") || wieq(s, L"--job") || wieq(s, L"--jobs");
 }
 
 static int is_force_flag(LPCWSTR s)
@@ -2935,6 +3331,8 @@ static int is_force_flag(LPCWSTR s)
 
 static LPCWSTR job_attached(LPCWSTR s)
 {
+	if (wistart(s, L"--jobs="))
+		return s + 7;
 	if (wistart(s, L"--job="))
 		return s + 6;
 	if (s[0] == L'-' && s[1] == L'j' && s[2] >= L'0' && s[2] <= L'9')
@@ -2962,17 +3360,25 @@ static LPCWSTR source_attached(LPCWSTR s)
 
 static void usage(void)
 {
-	fwprintf(stderr, L"Usage: speedcopy.exe [-f|--force] [-m|-md5] [-j|--job N] [-c|--csv FILE] [-s|--source PATH]... <destination>\n");
+	fwprintf(stderr, L"Usage: speedcopy.exe [-f|--force] [-n|--no-verify] [-m|-md5] [-j|--jobs N] [-c|--csv FILE] [-s|--source PATH]... <destination>\n");
 	fwprintf(stderr, L"       speedcopy.exe -h|--help\n");
 }
 
 static void help(void)
 {
 	fwprintf(stdout,
-		L"SpeedCopy %s\n"
-		L"Copy files and directories into one destination, then verify.\n"
+		L"________                 _________________\n"
+		L"__  ___/_______________________  /_  ____/__________________  __\n"
+		L"_____ \\___  __ \\  _ \\  _ \\  __  /_  /    _  __ \\__  __ \\_  / / /\n"
+		L"____/ /__  /_/ /  __/  __/ /_/ / / /___  / /_/ /_  /_/ /  /_/ /\n"
+		L"/____/ _  .___/\\___/\\___/\\__,_/  \\____/  \\____/_  .___/_\\__, /\n"
+		L"       /_/                                     /_/     /____/\n"
 		L"\n"
-		L"Usage: speedcopy.exe [-f|--force] [-m|-md5] [-j|--job N] [-c|--csv FILE] [-s|--source PATH]... <destination>\n"
+		L"Version %s\n"
+		L"Copy files and directories into one destination.\n"
+		L"Size and MD5 checks run on other tasks during the copy.\n"
+		L"\n"
+		L"Usage: speedcopy.exe [-f|--force] [-n|--no-verify] [-m|-md5] [-j|--jobs N] [-c|--csv FILE] [-s|--source PATH]... <destination>\n"
 		L"       speedcopy.exe -h|--help\n"
 		L"\n"
 		L"With no arguments, SpeedCopy opens a window.\n"
@@ -2986,30 +3392,47 @@ static void help(void)
 		L"        Show this help.\n"
 		L"\n"
 		L"-f, --force\n"
-		L"        Overwrite existing files. Without this, the copy stops when any\n"
-		L"        existing file would be replaced, and the error reports how many.\n"
-		L"        The scan stops once more than 1000 existing files would be replaced.\n"
-		L"        Files after that point are not copied.\n"
+		L"        Overwrite existing files. Without this, a check runs before the\n"
+		L"        copy. When any existing file would be replaced, the copy does not\n"
+		L"        start. The check counts up to 1000 files and writes one line to\n"
+		L"        the error output.\n"
+		L"        The window shows that same line and asks before it copies.\n"
+		L"\n"
+		L"-n, --no-verify\n"
+		L"        Copy only. No size or MD5 check runs. The protocol row is:\n"
+		L"        \"<src_path>\", <src_bytes>, \"<dst_path>\", \"OK\"/\"ERROR\"\n"
 		L"\n"
 		L"-m, -md5\n"
-		L"        Hash each source file while copying and each destination file\n"
-		L"        while verifying. Without this, verify compares file sizes only.\n"
+		L"        Hash each source file on other tasks while the copy runs, and\n"
+		L"        hash each destination file after that file has been copied.\n"
+		L"        The copy does not wait for a hash or a comparison. Without -n\n"
+		L"        and without -m, another task reads each destination size after\n"
+		L"        that file has been copied and compares it with the source size.\n"
+		L"        -n and -m together are rejected.\n"
 		L"\n"
 		L"-c, --csv FILE\n"
-		L"        Write a UTF-8 protocol, one row per file, after the copy and the\n"
-		L"        verify pass. An existing file is replaced without asking. The copy\n"
-		L"        does not start when the file cannot be written. The first line names\n"
-		L"        the columns. Compared by size:\n"
+		L"        Write a UTF-8 protocol, one row per file, after the copy. Checks\n"
+		L"        that are still running finish before the file is written. There\n"
+		L"        is no separate verification pass. An existing file is replaced\n"
+		L"        without asking. The copy does not start when the file cannot be\n"
+		L"        written. The first line names the columns. With -n:\n"
+		L"        \"<src_path>\", <src_bytes>, \"<dst_path>\", \"OK\"/\"ERROR\"\n"
+		L"        Compared by size:\n"
 		L"        \"<src_path>\", <src_bytes>, \"<dst_path>\", <dst_bytes>, \"OK\"/\"MISSMATCH\"\n"
 		L"        With -m or -md5 the row also stores both hashes:\n"
 		L"        \"<src_path>\", <src_bytes>, \"<src_md5>\", \"<dst_path>\", <dst_bytes>, \"<dst_md5>\", \"OK\"/\"MISSMATCH\"\n"
 		L"\n"
-		L"-j, --job N\n"
-		L"        Copy N files at a time. N is from 1 to the number of CPU cores.\n"
+		L"-j, --jobs N\n"
+		L"        Use at most N worker threads, from 1 to the number of CPU cores.\n"
 		L"        A smaller number is raised to 1 and a larger number is lowered\n"
-		L"        to that count. Each job holds two 512 MiB buffers. Without this,\n"
-		L"        the count is one job per core, lowered when those buffers would\n"
-		L"        use more than half of memory.\n"
+		L"        to that count. Copy threads and check threads together stay\n"
+		L"        within N. --job is the same option. With -n or --no-verify there\n"
+		L"        are no check threads, and at most 4 threads copy, because more\n"
+		L"        full-speed copies slow the disks. Each copy thread holds two\n"
+		L"        512 MiB buffers. Without this option the limit is one thread per\n"
+		L"        core, lowered when those buffers would use more than half of\n"
+		L"        memory. A size check uses one thread and no copy buffer. MD5\n"
+		L"        uses part of the same limit and does not run on a copy thread.\n"
 		L"\n"
 		L"-s, --source PATH\n"
 		L"        A file or directory to copy. Repeat this for every source.\n"
@@ -3029,11 +3452,17 @@ static void help(void)
 		L"A file whose data is not on this disk is skipped. Reserved names such as CON,\n"
 		L"and names with a trailing dot or space, are copied as files.\n"
 		L"The sources and the destination are read first. Then the files are copied.\n"
-		L"-m or -md5 hashes each source file during that copy. Last, one verify pass\n"
-		L"compares sizes, or MD5 hashes when that was selected.\n"
+		L"Size and MD5 checks run on other tasks during that copy. The copy does\n"
+		L"not wait on them. A size check reads the destination size after that\n"
+		L"file has been copied. An MD5 check hashes the source on its own and\n"
+		L"hashes the destination after the copy of that file. Those tasks run\n"
+		L"at background priority, so they do not take the copy's disk time.\n"
+		L"The run waits for them only after every copy has finished, so the\n"
+		L"protocol and the mismatch count are complete.\n"
 		L"An existing directory is written into. The copy does not start when that\n"
-		L"directory cannot be written. An existing file stops the copy, unless\n"
-		L"-f or --force is set. The window asks before it replaces a file.\n"
+		L"directory cannot be written. Without -f or --force, the check above\n"
+		L"stops the copy when an existing file would be replaced. The window\n"
+		L"shows that line and asks before it starts the copy again with -f.\n"
 		L"Creation, access, and write times are kept, with the archive, hidden,\n"
 		L"system, read-only, temporary, and not-content-indexed attributes.\n"
 		L"Large files use overlapped unbuffered transfers.\n"
@@ -3082,7 +3511,7 @@ static int csv_can_write(LPCWSTR path, DWORD *err_out)
 	return 1;
 }
 
-/* Replace an existing protocol. Called only after copy and verify. */
+/* Replace an existing protocol. Called after the copy, once checks have finished. */
 static int open_csv(void)
 {
 	LPWSTR owned = NULL;
@@ -3176,7 +3605,7 @@ int gui_main(void);
 int main(void)
 {
 	int argc, rc = 1, i, nitems = 0, nsrc = 0, s, any = 0;
-	int argc_probe = 0;
+	int argc_probe = 0, saw_none = 0, saw_md5 = 0;
 	LPWSTR *probe;
 	LPWSTR *argv = NULL;
 	LPCWSTR *texts = NULL;
@@ -3185,12 +3614,18 @@ int main(void)
 	LPWSTR dest = NULL;
 	LPCWSTR attached;
 	struct job_queue queue;
+	struct work_queue checks;
 	struct pool workers;
+	struct pool checkers;
 	struct tick run_clock;
 	DWORD attr;
 	int queue_ready = 0;
+	int checks_ready = 0;
 	int copy_running = 0;
-	int verified = 0;
+	int check_running = 0;
+	int checks_later = 0;
+	int copy_n = 1;
+	int check_n = 0;
 
 	probe = CommandLineToArgvW(GetCommandLineW(), &argc_probe);
 	if (probe && argc_probe < 2) {
@@ -3209,7 +3644,9 @@ int main(void)
 	InitializeCriticalSection(&g_out_lock);
 	g_out_lock_ready = 1;
 	ZeroMemory(&queue, sizeof(queue));
+	ZeroMemory(&checks, sizeof(checks));
 	ZeroMemory(&workers, sizeof(workers));
+	ZeroMemory(&checkers, sizeof(checkers));
 
 	argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 	if (!argv) {
@@ -3232,12 +3669,22 @@ int main(void)
 			rc = 0;
 			goto done;
 		}
-		if (is_md5_flag(a)) {
-			g_md5 = 1;
+		if (is_none_flag(a)) {
+			if (saw_md5) {
+				warn(L"the copy did not start. Choose either -n or -m, not both");
+				goto done;
+			}
+			saw_none = 1;
+			g_verify = VERIFY_NONE;
 			continue;
 		}
-		if (is_ask_flag(a)) {
-			g_ask = 1;
+		if (is_md5_flag(a)) {
+			if (saw_none) {
+				warn(L"the copy did not start. Choose either -n or -m, not both");
+				goto done;
+			}
+			saw_md5 = 1;
+			g_verify = VERIFY_MD5;
 			continue;
 		}
 		if (is_force_flag(a)) {
@@ -3454,63 +3901,102 @@ int main(void)
 	}
 	queue_ready = 1;
 
-	fwprintf(stdout, L"SpeedCopy %s, %d jobs\n", VERSION, task_count());
+	if (!g_force) {
+		g_overwrite_pass = 1;
+		for (s = 0; s < nsrc; s++) {
+			if (g_scan_stop)
+				break;
+			attr = get_attrs(sources[s]);
+			if (attr == INVALID_FILE_ATTRIBUTES)
+				continue;
+			add_source(&queue, sources[s], dest);
+		}
+		g_overwrite_pass = 0;
+		if (g_overwrite > 0) {
+			report_overwrites();
+			rc = 1;
+			goto done;
+		}
+		g_scan_stop = 0;
+		g_walk_err = 0;
+		g_warn = 0;
+	}
+	thread_plan(&copy_n, &check_n);
+	if (check_n > 0)
+		fwprintf(stdout, L"SpeedCopy %s, %d copy threads, %d check threads\n",
+			VERSION, copy_n, check_n);
+	else
+		fwprintf(stdout, L"SpeedCopy %s, %d copy threads\n", VERSION, copy_n);
 	fflush(stdout);
 	tick_start(&run_clock);
 	for (s = 0; s < nsrc; s++) {
-		if (g_scan_stop)
-			break;
 		attr = get_attrs(sources[s]);
 		if (attr == INVALID_FILE_ATTRIBUTES)
 			continue;
 		add_source(&queue, sources[s], dest);
 	}
-	if (g_overwrite > 0 && !g_force) {
-		if (g_ask) {
-			if (!confirm_overwrite()) {
-				fwprintf(stdout, L"Copy cancelled\n");
-				fflush(stdout);
-				rc = 2;
-				goto done;
-			}
-			tick_start(&run_clock);
-		} else if (g_overwrite == 1) {
-			warn(L"the copy did not start. 1 file would be overwritten. Use -f or --force to overwrite it");
-			goto done;
-		} else if (g_overwrite > OVERWRITE_COUNT_LIMIT) {
-			warn(L"the copy did not start. More than 1000 files would be overwritten. Use -f or --force to overwrite them");
-			goto done;
-		} else {
-			warn(L"the copy did not start. %llu files would be overwritten. Use -f or --force to overwrite them",
-				(unsigned long long)g_overwrite);
-			goto done;
-		}
-	}
 	start_stop_watcher();
 	if (g_queued) {
+		const wchar_t *note = L"";
+
 		create_planned_dirs();
-		if (pool_start(&workers, &queue, copy_task) || workers.ready == 0) {
+		if (g_verify == VERIFY_MD5 || (g_verify == VERIFY_SIZE && check_n > 0)) {
+			if (work_init(&checks)) {
+				warn(L"the copy did not start. Cannot create the check queue");
+				goto done;
+			}
+			checks_ready = 1;
+			g_checks = &checks;
+		}
+		/* Copy buffers are taken first. Check tasks use what is left and never run on a copy thread. */
+		if (pool_start(&workers, &queue, copy_task, copy_n) || workers.ready == 0) {
 			if (workers.started)
 				pool_join(&workers, &queue);
 			warn(L"the copy did not start. Not enough memory for a copy buffer. Each job needs two buffers of at least 1 MiB");
 			goto done;
 		}
 		copy_running = 1;
+		if (checks_ready && check_n > 0) {
+			if (pool_start_work(&checkers, &checks, check_task, check_n) || checkers.ready == 0) {
+				if (checkers.started)
+					pool_join_work(&checkers, &checks);
+				if (g_verify == VERIFY_MD5) {
+					warn(L"verification did not run because there is not enough memory for an MD5 buffer");
+					g_verify_oom = 1;
+				} else {
+					warn(L"the copy did not start. Cannot start a task to check sizes");
+					goto done;
+				}
+			} else {
+				InterlockedExchange(&g_check_live, 1);
+				check_running = 1;
+			}
+		} else if (checks_ready) {
+			/* One thread slot. Hash after the copy so the limit still holds. */
+			InterlockedExchange(&g_check_live, 1);
+			checks_later = 1;
+		}
 		g_phase = 0;
 		tick_start(&g_phase_tick);
+		if (g_verify == VERIFY_SIZE)
+			note = L", checking sizes";
+		else if (g_verify == VERIFY_MD5 && (check_running || checks_later))
+			note = L", checking MD5";
 		{
 			WCHAR hb[40];
 
 			human_bytes(hb, 40, (ULONGLONG)g_total_bytes);
 			if (g_queued == 1)
-				fwprintf(stdout, L"Starting copy pass (1 of 2): 1 file, %s\n", hb);
+				fwprintf(stdout, L"Starting copy: 1 file, %s%s\n", hb, note);
 			else
-				fwprintf(stdout, L"Starting copy pass (1 of 2): %llu files, %s\n",
-					(unsigned long long)g_queued, hb);
+				fwprintf(stdout, L"Starting copy: %llu files, %s%s\n",
+					(unsigned long long)g_queued, hb, note);
 			fflush(stdout);
 		}
 		progress_start();
 		enqueue_catalog(&queue);
+		if (g_verify == VERIFY_MD5 && (check_running || checks_later))
+			enqueue_src_hashes(&checks);
 		pool_join(&workers, &queue);
 		copy_running = 0;
 		stamp_dirs();
@@ -3525,34 +4011,34 @@ int main(void)
 			warn(L"the copy was stopped. More than 10000 files could not be copied");
 			goto done;
 		}
-
-		g_phase = 1;
-		InterlockedExchange(&queue.ready, 0);
-		tick_start(&g_phase_tick);
-		if (g_queued == 1)
-			fwprintf(stdout, L"Starting verify pass (2 of 2): 1 file, %s\n",
-				g_md5 ? L"checking MD5 hashes" : L"checking sizes");
-		else
-			fwprintf(stdout, L"Starting verify pass (2 of 2): %llu files, %s\n",
-				(unsigned long long)g_queued,
-				g_md5 ? L"checking MD5 hashes" : L"checking sizes");
-		fflush(stdout);
-		progress_start();
-		if (pool_start(&workers, &queue, verify_task) == 0 && workers.ready > 0) {
-			enqueue_catalog(&queue);
-			pool_join(&workers, &queue);
-			verified = 1;
-		} else {
-			if (workers.started)
-				pool_join(&workers, &queue);
-			verify_all_main();
-			verified = !g_verify_oom;
+		if (checks_later) {
+			checks_later = 0;
+			if (pool_start_work(&checkers, &checks, check_task, 1) || checkers.ready == 0) {
+				if (checkers.started)
+					pool_join_work(&checkers, &checks);
+				warn(L"verification did not run because there is not enough memory for an MD5 buffer");
+				g_verify_oom = 1;
+			} else {
+				check_running = 1;
+			}
 		}
-		progress_stop();
-		if (verified)
+		if (check_running) {
+			if (g_settled < g_queued) {
+				g_tail_base = g_ver_progress;
+				g_phase = 1;
+				tick_start(&g_phase_tick);
+				progress_start();
+			}
+			pool_join_work(&checkers, &checks);
+			check_running = 0;
+			progress_stop();
 			write_csv();
-		if (verified)
-			print_verify_summary();
+			print_check_summary();
+		} else if (!g_verify_oom) {
+			write_csv();
+			print_protocol();
+			fflush(stdout);
+		}
 		print_run_summary(tick_ms(&run_clock));
 	} else if (g_warn || g_walk_err) {
 		warn(L"the copy did not start because no file could be queued");
@@ -3560,7 +4046,12 @@ int main(void)
 	} else {
 		print_copy_summary();
 		write_csv();
-		print_verify_summary();
+		if (g_verify == VERIFY_NONE) {
+			print_protocol();
+			fflush(stdout);
+		} else {
+			print_check_summary();
+		}
 		print_run_summary(tick_ms(&run_clock));
 	}
 
@@ -3572,6 +4063,15 @@ done:
 		pool_join(&workers, &queue);
 		stamp_dirs();
 	}
+	if (check_running) {
+		InterlockedExchange(&g_stop, 1);
+		pool_join_work(&checkers, &checks);
+		check_running = 0;
+	}
+	g_checks = NULL;
+	InterlockedExchange(&g_check_live, 0);
+	if (checks_ready)
+		work_free(&checks);
 	while (g_dirs) {
 		struct dir_stamp *d = g_dirs;
 

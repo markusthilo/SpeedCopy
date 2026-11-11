@@ -1,8 +1,8 @@
 # SpeedCopy
 
-Fast recursive copy for Windows 10/11 (64-bit), with a size or MD5 verify pass afterward.
+Fast recursive copy for Windows 10/11 (64-bit). Size or MD5 checks run alongside the copy.
 
-![image info](./SpeedCopy_v0.1.0.png)
+![image info](./speedcopy.png)
 
 This is a one file standalone application - `speedcopy.exe` is all you need. No runtime DLLs to ship. With no arguments, a window opens. With arguments, it runs as a command-line tool.
 
@@ -11,9 +11,10 @@ This is a one file standalone application - `speedcopy.exe` is all you need. No 
 - Copy files and folders into one destination directory or volume
 - Each source is placed under its own name (`D:\photos` → `E:\backup\photos\...`)
 - A drive root is placed directly (`D:\` → children of `E:\backup\`)
-- Size verify by default; optional MD5 (`-m` / `-md5`)
+- No verification (`-n` / `--no-verify`), size check by default, or MD5 (`-m` / `-md5`)
+- Checks run on other tasks during the copy. The copy does not wait on them
 - Optional UTF-8 CSV protocol (`-c` / `--csv`)
-- Parallel jobs (`-j` / `--job`), default one job per CPU core
+- Parallel threads (`-j` / `--jobs`), at most one per CPU core. With no verification, at most 4 copy threads
 - Keeps creation, access, and write times, plus ordinary attributes
 - Junctions and symbolic links are skipped
 - Long paths are supported
@@ -21,7 +22,7 @@ This is a one file standalone application - `speedcopy.exe` is all you need. No 
 ## Usage
 
 ```text
-speedcopy.exe [-f|--force] [-m|-md5] [-j|--job N] [-c|--csv FILE] [-s|--source PATH]... <destination>
+speedcopy.exe [-f|--force] [-n|--no-verify] [-m|-md5] [-j|--jobs N] [-c|--csv FILE] [-s|--source PATH]... <destination>
 speedcopy.exe -h|--help
 ```
 

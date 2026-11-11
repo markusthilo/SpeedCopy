@@ -37,6 +37,7 @@ int speedcopy_correct_jobs(const wchar_t *s, int *out);
 #define ID_BROWSEDEST  107
 #define ID_CSV         108
 #define ID_BROWSECSV   109
+#define ID_VERIFY_NONE 120
 #define ID_VERIFY_SIZE 110
 #define ID_VERIFY_MD5  117
 #define ID_JOBS        118
@@ -55,8 +56,9 @@ int speedcopy_correct_jobs(const wchar_t *s, int *out);
 #define ID_LAB_VMODE  -26
 #define ID_LAB_JOBS   -25
 
-#define WM_APP_LOG  (WM_APP + 1)
-#define WM_APP_DONE (WM_APP + 2)
+#define WM_APP_LOG       (WM_APP + 1)
+#define WM_APP_DONE      (WM_APP + 2)
+#define WM_APP_OVERWRITE (WM_APP + 3)
 
 #define ST_IDLE 0
 #define ST_RUN  1
@@ -74,6 +76,8 @@ static CRITICAL_SECTION g_lock;
 static HANDLE g_proc;
 static HANDLE g_child_in;
 static volatile LONG g_abort;
+static volatile LONG g_rerun_force;
+static volatile LONG g_overwrite_cancel;
 static HDWP g_hdwp;
 
 static HWND mkctl(HWND parent, const wchar_t *cls, const wchar_t *text, DWORD style, int id)
@@ -907,35 +911,109 @@ static void kill_child(void)
 	LeaveCriticalSection(&g_lock);
 }
 
+static char *normalize_line(char *line)
+{
+	char *end;
+
+	if ((unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB
+		&& (unsigned char)line[2] == 0xBF)
+		line += 3;
+	while (*line == ' ' || *line == '\t')
+		line++;
+	end = line + strlen(line);
+	while (end > line && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r'))
+		*--end = 0;
+	return line;
+}
+
+static int ends_with(const char *line, const char *tail)
+{
+	size_t n = strlen(line);
+	size_t tail_n = strlen(tail);
+
+	if (n < tail_n)
+		return 0;
+	return memcmp(line + n - tail_n, tail, tail_n) == 0;
+}
+
+/* The count line ends with "overwritten." The next line tells a console
+ * user to pass -f. Either one opens the dialog, once. */
+static int is_overwrite_line(const char *line)
+{
+	return ends_with(line, "overwritten.");
+}
+
+static int is_force_hint(const char *line)
+{
+	return strcmp(line, "Use -f or --force to copy anyway.") == 0;
+}
+
+static wchar_t *with_force(const wchar_t *cmd)
+{
+	const wchar_t *rest;
+	wchar_t *out;
+	size_t head, n;
+
+	if (!cmd || !cmd[0])
+		return NULL;
+	rest = cmd;
+	if (*rest == L'"') {
+		rest++;
+		while (*rest && *rest != L'"')
+			rest++;
+		if (*rest == L'"')
+			rest++;
+	} else {
+		while (*rest && *rest != L' ')
+			rest++;
+	}
+	head = (size_t)(rest - cmd);
+	n = wcslen(cmd);
+	out = LocalAlloc(LMEM_FIXED, (n + 4) * sizeof(wchar_t));
+	if (!out)
+		return NULL;
+	memcpy(out, cmd, head * sizeof(wchar_t));
+	memcpy(out + head, L" -f", 3 * sizeof(wchar_t));
+	memcpy(out + head + 3, rest, (n - head + 1) * sizeof(wchar_t));
+	return out;
+}
+
+static int g_overwrite_asked;
+
+static void ask_overwrite(HWND hwnd, const char *text)
+{
+	wchar_t msg[200];
+	int n, yes;
+
+	if (g_overwrite_asked)
+		return;
+	g_overwrite_asked = 1;
+	n = MultiByteToWideChar(CP_UTF8, 0, text, -1, msg, 200);
+	if (n <= 0)
+		lstrcpyW(msg, L"Files already exist and would be overwritten.");
+	msg[199] = 0;
+	yes = (int)SendMessageW(hwnd, WM_APP_OVERWRITE, 0, (LPARAM)msg) == IDYES;
+	if (yes)
+		InterlockedExchange(&g_rerun_force, 1);
+	else
+		InterlockedExchange(&g_overwrite_cancel, 1);
+}
+
 static void deliver_line(HWND hwnd, HANDLE in_wr, char *line, size_t ln, int progress)
 {
+	char *text;
+
+	(void)in_wr;
 	if (!ln)
 		return;
 	line[ln] = 0;
-	if (!progress && strncmp(line, "ASK ", 4) == 0) {
-		long long count = strtoll(line + 4, NULL, 10);
-		wchar_t ask[180];
-		int yes;
-		DWORD wrote = 0;
-		const char *ans;
-
-		if (count < 0)
-			count = 0;
-		if (count > 1000)
-			_snwprintf(ask, 180,
-				L"More than 1000 files will be overwritten.\n\nCopy anyway?");
-		else if (count == 1)
-			_snwprintf(ask, 180,
-				L"1 file already exists and will be overwritten.\n\nCopy anyway?");
-		else
-			_snwprintf(ask, 180,
-				L"%lld files already exist and will be overwritten.\n\nCopy anyway?",
-				count);
-		ask[179] = 0;
-		yes = MessageBoxW(hwnd, ask, L"SpeedCopy",
-			MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
-		ans = yes ? "y\n" : "n\n";
-		WriteFile(in_wr, ans, 2, &wrote, NULL);
+	text = normalize_line(line);
+	if (!progress && is_overwrite_line(text)) {
+		ask_overwrite(hwnd, text);
+		return;
+	}
+	if (!progress && is_force_hint(text)) {
+		ask_overwrite(hwnd, "Files already exist and would be overwritten.");
 		return;
 	}
 	if (progress && strcmp(line, "...") == 0) {
@@ -956,6 +1034,7 @@ static int run_copy(HWND hwnd, const wchar_t *exe, wchar_t *cmd)
 	size_t ln = 0;
 	int drop = 0, pending_cr = 0;
 
+	g_overwrite_asked = 0;
 	if (InterlockedCompareExchange(&g_abort, 0, 0))
 		return 1;
 	ZeroMemory(&sa, sizeof(sa));
@@ -1069,6 +1148,30 @@ static DWORD WINAPI worker_main(LPVOID arg)
 	int rc = run_copy(j->hwnd, j->exe, j->cmd);
 	int stopped = InterlockedCompareExchange(&g_abort, 0, 0) ? 1 : 0;
 
+	if (!stopped && InterlockedCompareExchange(&g_rerun_force, 0, 0)) {
+		wchar_t *forced = with_force(j->cmd);
+
+		InterlockedExchange(&g_rerun_force, 0);
+		InterlockedExchange(&g_overwrite_cancel, 0);
+		if (forced) {
+			wchar_t *shown;
+			size_t n = wcslen(forced);
+
+			shown = LocalAlloc(LMEM_FIXED, (n + 10) * sizeof(wchar_t));
+			if (shown) {
+				lstrcpyW(shown, L"Running: ");
+				lstrcatW(shown, forced);
+				post_log(j->hwnd, shown);
+				LocalFree(shown);
+			}
+			LocalFree(j->cmd);
+			j->cmd = forced;
+			rc = run_copy(j->hwnd, j->exe, j->cmd);
+			stopped = InterlockedCompareExchange(&g_abort, 0, 0) ? 1 : 0;
+		}
+	} else if (!stopped && InterlockedCompareExchange(&g_overwrite_cancel, 0, 0)) {
+		rc = 2;
+	}
 	PostMessageW(j->hwnd, WM_APP_DONE, (WPARAM)rc, (LPARAM)stopped);
 	LocalFree(j->exe);
 	LocalFree(j->cmd);
@@ -1165,7 +1268,7 @@ static void note_jobs_edit(HWND hwnd, int empty_to_one)
 static void set_busy(HWND hwnd, int busy)
 {
 	static const int off[] = {
-		ID_ADD, ID_REMOVE, ID_VERIFY_SIZE, ID_VERIFY_MD5, ID_JOBS, ID_JOBS_SPIN,
+		ID_ADD, ID_REMOVE, ID_VERIFY_NONE, ID_VERIFY_SIZE, ID_VERIFY_MD5, ID_JOBS, ID_JOBS_SPIN,
 		ID_DEST, ID_CSV, ID_BROWSEDEST, ID_BROWSECSV, ID_SRCLIST
 	};
 	int i;
@@ -1219,7 +1322,7 @@ static int build_cmd(HWND hwnd, wbuf *out, wchar_t **exe_out)
 	wchar_t *exe, *dest, *csv, *jobs = NULL, *src_text = NULL;
 	const wchar_t *dest_s, *csv_s, *jobs_s;
 	struct srcs srcs;
-	int i, md5, ready = 0, ok = 0;
+	int i, md5, none, ready = 0, ok = 0;
 
 	srcs.p = NULL;
 	srcs.n = srcs.cap = 0;
@@ -1252,9 +1355,10 @@ static int build_cmd(HWND hwnd, wbuf *out, wchar_t **exe_out)
 		goto done;
 	}
 	jobs_s = trimmed(jobs);
+	none = (int)SendMessageW(GetDlgItem(hwnd, ID_VERIFY_NONE), BM_GETCHECK, 0, 0) == BST_CHECKED;
 	md5 = (int)SendMessageW(GetDlgItem(hwnd, ID_VERIFY_MD5), BM_GETCHECK, 0, 0) == BST_CHECKED;
 	ready = 1;
-	if (!wb_quoted(out, exe) || !wb_add(out, L" --ask"))
+	if (!wb_quoted(out, exe))
 		goto done;
 	if (jobs_s[0]) {
 		int n = 0;
@@ -1275,6 +1379,8 @@ static int build_cmd(HWND hwnd, wbuf *out, wchar_t **exe_out)
 		if (!wb_add(out, L" -j 1"))
 			goto done;
 	}
+	if (none && !wb_add(out, L" -n"))
+		goto done;
 	if (md5 && !wb_add(out, L" -m"))
 		goto done;
 	if (csv_s[0]) {
@@ -1356,6 +1462,8 @@ static void start_copy(HWND hwnd)
 	j->exe = exe;
 	j->cmd = cmd.s;
 	InterlockedExchange(&g_abort, 0);
+	InterlockedExchange(&g_rerun_force, 0);
+	InterlockedExchange(&g_overwrite_cancel, 0);
 	SetWindowTextW(g_log, L"");
 	{
 		size_t n = (size_t)lstrlenW(cmd.s);
@@ -1396,6 +1504,7 @@ static void stop_copy(HWND hwnd)
 static void on_done(HWND hwnd, int rc, int stopped)
 {
 	set_busy(hwnd, 0);
+	EnableWindow(GetDlgItem(hwnd, ID_QUIT), TRUE);
 	if (stopped)
 		set_status(hwnd, ST_ERR, L"Stopped");
 	else if (rc == 2)
@@ -1412,7 +1521,8 @@ static void on_done(HWND hwnd, int rc, int stopped)
 static void show_help(HWND hwnd)
 {
 	static const wchar_t text[] =
-		L"SpeedCopy copies files and folders into one destination, then verifies.\n\n"
+		L"SpeedCopy copies files and folders into one destination. "
+		L"Size or MD5 checks run alongside the copy. None copies only.\n\n"
 		L"Sources\n"
 		L"One path per line. Type a path, or paste paths with Ctrl-V. "
 		L"Add selects several files and folders at once. Remove deletes the line at the cursor. "
@@ -1423,9 +1533,12 @@ static void show_help(HWND hwnd)
 		L"A drive root such as D:\\ is copied directly, so its children keep their paths. "
 		L"An existing directory is written into. "
 		L"The copy does not start when that directory cannot be written. "
-		L"If any file would be replaced, SpeedCopy asks before copying. "
-		L"The scan stops once more than 1000 files would be replaced, and files after that are not copied. "
-		L"No leaves every file as it is and aborts the copy. "
+		L"If any file would be replaced, SpeedCopy shows how many and asks before copying. "
+		L"That line is the same one written to the error output: "
+		L"1 file already exists and would be overwritten, "
+		L"N files already exist and would be overwritten, "
+		L"or >1000 files already exist and would be overwritten. "
+		L"No leaves every file as it is and does not start the copy. "
 		L"Stop leaves finished files and deletes a file that was only partly copied. "
 		L"The copy stops when more than 10000 files could not be copied. "
 		L"Times and ordinary attributes are kept.\n\n"
@@ -1433,19 +1546,25 @@ static void show_help(HWND hwnd)
 		L"Optional. One row per file. "
 		L"If that file already exists, SpeedCopy asks before replacing it. "
 		L"The copy does not start when the file cannot be written. "
-		L"It is written after the copy and the verify pass. "
+		L"It is written after the copy. Checks still running finish before it is written. "
 		L"The first line names the columns. "
-		L"Size mode stores the two paths, the two sizes, and OK or MISSMATCH. "
-		L"MD5 mode also stores both hashes.\n\n"
+		L"No verification stores the two paths, the source size, and OK or ERROR. "
+		L"Size stores the two paths, the two sizes, and OK or MISSMATCH. "
+		L"MD5 also stores both hashes.\n\n"
 		L"Verify\n"
-		L"Size compares file sizes after the copy. "
-		L"MD5 hashes each source while copying and each destination while verifying. "
+		L"None copies only. "
+		L"Size reads each destination size on another task after that file has been copied and compares it. "
+		L"MD5 hashes each source on other tasks during the copy, and hashes each destination after that file has been copied. "
+		L"The copy does not wait on a hash or a comparison. "
 		L"A mismatch is a warning in the log and the status shows Error. "
 		L"A finished copy with no mismatches shows Finished.\n\n"
 		L"Jobs\n"
-		L"How many files are copied at a time. The number shown at start is one job per CPU core, "
+		L"The maximum number of threads. Copy threads and check threads together stay within it. "
+		L"The number shown at start is one thread per CPU core, "
 		L"lowered when the copy buffers would use more than half of memory. "
-		L"Each job holds two 512 MiB buffers. Arrows stop at 1 and at the number of CPU cores. "
+		L"With no verification there are no check threads, and at most 4 threads copy, "
+		L"because more full-speed copies slow the disks. "
+		L"Each copy thread holds two 512 MiB buffers. Arrows stop at 1 and at the number of CPU cores. "
 		L"A typed number below 1 becomes 1, and a number above the core count becomes that count.";
 
 	MessageBoxW(hwnd, text, L"SpeedCopy", MB_OK | MB_ICONINFORMATION);
@@ -1492,7 +1611,7 @@ static void layout(HWND hwnd, int cx, int cy)
 	static const int labs[] = { ID_LAB_DEST, ID_LAB_CSV, ID_LAB_VERIFY };
 	static const int side[] = { ID_ADD, ID_REMOVE, ID_BROWSEDEST, ID_BROWSECSV };
 	int margin, row, gap, lab, btn, ch, cw, y, x, w, field;
-	int box, pref, chrome, i, best, btn_y, size_w, md5_w, job_w, job_lab, mode_w;
+	int box, pref, chrome, i, best, btn_y, none_w, size_w, md5_w, job_w, job_lab, mode_w;
 	HDC dc;
 	HFONT old;
 
@@ -1513,6 +1632,7 @@ static void layout(HWND hwnd, int cx, int cy)
 			best = tw;
 	}
 	btn = best;
+	none_w = ctl_text_px(dc, hwnd, ID_VERIFY_NONE) + 24;
 	size_w = ctl_text_px(dc, hwnd, ID_VERIFY_SIZE) + 24;
 	md5_w = ctl_text_px(dc, hwnd, ID_VERIFY_MD5) + 24;
 	mode_w = ctl_text_px(dc, hwnd, ID_LAB_VMODE) + 4;
@@ -1531,11 +1651,11 @@ static void layout(HWND hwnd, int cx, int cy)
 	}
 	x = margin;
 	w = cx - 2 * margin;
-	if (w < 64 * cw + GetSystemMetrics(SM_CXVSCROLL))
-		w = 64 * cw + GetSystemMetrics(SM_CXVSCROLL);
+	if (w < 96 * cw + GetSystemMetrics(SM_CXVSCROLL))
+		w = 96 * cw + GetSystemMetrics(SM_CXVSCROLL);
 	y = margin;
 
-	g_hdwp = BeginDeferWindowPos(24);
+	g_hdwp = BeginDeferWindowPos(28);
 	{
 		int rx = x + w;
 		int labw;
@@ -1569,10 +1689,12 @@ static void layout(HWND hwnd, int cx, int cy)
 		place(hwnd, ID_LAB_VERIFY, x, y, lab, row);
 		place(hwnd, ID_LAB_VMODE, fx, y, mode_w, row);
 		fx += mode_w + step;
+		place(hwnd, ID_VERIFY_NONE, fx, y, none_w, row);
+		fx += none_w + step;
 		place(hwnd, ID_VERIFY_SIZE, fx, y, size_w, row);
 		fx += size_w + step;
 		place(hwnd, ID_VERIFY_MD5, fx, y, md5_w, row);
-		fx += md5_w + step * 4;
+		fx += md5_w + step * 2;
 		place(hwnd, ID_LAB_JOBS, fx, y, job_lab, row);
 		fx += job_lab + gap;
 		place(hwnd, ID_JOBS, fx, y, job_w, row);
@@ -1631,8 +1753,10 @@ static void create_ui(HWND hwnd)
 	mkctl(hwnd, L"BUTTON", L"Browse", WS_TABSTOP | BS_PUSHBUTTON, ID_BROWSECSV);
 	mkctl(hwnd, L"STATIC", L"Options", SS_LEFT | SS_CENTERIMAGE, ID_LAB_VERIFY);
 	mkctl(hwnd, L"STATIC", L"Verify:", SS_LEFT | SS_CENTERIMAGE, ID_LAB_VMODE);
+	mkctl(hwnd, L"BUTTON", L"None",
+		WS_TABSTOP | WS_GROUP | BS_AUTORADIOBUTTON, ID_VERIFY_NONE);
 	mkctl(hwnd, L"BUTTON", L"Size",
-		WS_TABSTOP | WS_GROUP | BS_AUTORADIOBUTTON, ID_VERIFY_SIZE);
+		WS_TABSTOP | BS_AUTORADIOBUTTON, ID_VERIFY_SIZE);
 	mkctl(hwnd, L"BUTTON", L"MD5 hash",
 		WS_TABSTOP | BS_AUTORADIOBUTTON, ID_VERIFY_MD5);
 	SendMessageW(GetDlgItem(hwnd, ID_VERIFY_SIZE), BM_SETCHECK, BST_CHECKED, 0);
@@ -1668,6 +1792,7 @@ static void create_ui(HWND hwnd)
 	mkctl(hwnd, L"BUTTON", L"Quit", WS_TABSTOP | BS_PUSHBUTTON, ID_QUIT);
 	EnableWindow(GetDlgItem(hwnd, ID_START), FALSE);
 	EnableWindow(GetDlgItem(hwnd, ID_STOP), FALSE);
+	EnableWindow(GetDlgItem(hwnd, ID_QUIT), FALSE);
 
 	log = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
 		WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL |
@@ -1780,6 +1905,18 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_APP_DONE:
 		on_done(hwnd, (int)wp, (int)lp);
 		return 0;
+	case WM_APP_OVERWRITE: {
+		wchar_t ask[240];
+		const wchar_t *msg = (const wchar_t *)lp;
+
+		if (!msg || !msg[0])
+			msg = L"Files already exist and would be overwritten.";
+		_snwprintf(ask, 240, L"%s\n\nCopy anyway?", msg);
+		ask[239] = 0;
+		SetForegroundWindow(hwnd);
+		return MessageBoxW(hwnd, ask, L"SpeedCopy",
+			MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND);
+	}
 	case WM_TIMER:
 		if (g_state == ST_ERR && g_status) {
 			g_blink = !g_blink;
@@ -1837,7 +1974,7 @@ static void window_geom(int *x, int *y, int *w, int *h)
 	min_client_h = 2 * margin + 4 * (row + gap) + 2 * row + 3 * gap + 2 * (4 * ch + 6);
 	minr.left = 0;
 	minr.top = 0;
-	minr.right = margin * 2 + 64 * cw + GetSystemMetrics(SM_CXVSCROLL);
+	minr.right = margin * 2 + 96 * cw + GetSystemMetrics(SM_CXVSCROLL);
 	minr.bottom = min_client_h;
 	AdjustWindowRect(&minr, WS_OVERLAPPEDWINDOW, FALSE);
 	g_min_w = minr.right - minr.left;
